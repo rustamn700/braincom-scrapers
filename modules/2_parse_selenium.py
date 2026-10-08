@@ -10,6 +10,10 @@ import subprocess
 import time
 
 import undetected_chromedriver as uc
+
+# Suppress Windows [WinError 6] destructor bug
+uc.Chrome.__del__ = lambda self: None
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
