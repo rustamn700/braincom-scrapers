@@ -15,10 +15,10 @@ from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import Error as PlaywrightError
 
-from load_django import *
+import load_django
 from parser_app.models import Product
 
-SEARCH_QUERY = "Apple iPhone 18 Pro"
+SEARCH_QUERY = "Apple iPhone 17 Pro Max"
 BASE_URL = "https://brain.com.ua/"
 
 
@@ -29,6 +29,14 @@ def get_specification_value(specs_dict: dict, search_terms: list):
             if term.lower() in key.lower():
                 return value
     return None
+
+
+def extract_digits(raw_value: str):
+    """Extracts purely numerical digits from text or returns None."""
+    if not raw_value:
+        return None
+    digits = "".join(filter(str.isdigit, raw_value))
+    return digits if digits else None
 
 
 def main():
@@ -54,7 +62,7 @@ def main():
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
             });
-        """
+            """
         )
 
         try:
@@ -104,9 +112,7 @@ def main():
             # 2. Product Code (SKU)
             product_data["product_code"] = None
             try:
-                code_locators = page.locator(
-                    "//span[contains(@class, 'br-pr-code-val')]"
-                ).all()
+                code_locators = page.locator("//span[contains(@class, 'br-pr-code-val')]").all()
                 for code in code_locators:
                     txt = code.inner_text().strip()
                     if txt:
@@ -115,134 +121,107 @@ def main():
             except (PlaywrightTimeoutError, PlaywrightError):
                 product_data["product_code"] = None
 
-            # 3. Vendor
+            # 3. Complete Specifications Dictionary
+            specs_dict = {}
+            try:
+                spec_rows = page.locator("//*[@id='br-characteristics']//div").all()
+                for row in spec_rows:
+                    spans = row.locator("span").all()
+                    if len(spans) >= 2:
+                        key_title = spans[0].inner_text().strip()
+                        val_title = spans[1].inner_text().strip()
+                        if key_title and val_title and key_title not in specs_dict:
+                            specs_dict[key_title] = val_title
+                product_data["specifications"] = specs_dict
+            except (PlaywrightTimeoutError, PlaywrightError):
+                product_data["specifications"] = {}
+
+            # 4. Vendor (Dynamic extraction without hardcoded strings)
             product_data["vendor"] = None
             try:
                 vendor_meta = page.locator("//meta[@itemprop='brand']")
-                if vendor_meta.count() > 0:
-                    product_data["vendor"] = vendor_meta.first.get_attribute(
-                        "content"
-                    ).strip()
-                elif (
-                    product_data.get("title")
-                    and "Apple" in product_data["title"]
-                ):
-                    product_data["vendor"] = "Apple"
-            except (PlaywrightTimeoutError, PlaywrightError):
+                if vendor_meta.count() > 0 and vendor_meta.first.get_attribute("content"):
+                    product_data["vendor"] = vendor_meta.first.get_attribute("content").strip()
+                else:
+                    spec_vendor = get_specification_value(specs_dict, ["Виробник", "Бренд", "Производитель"])
+                    if spec_vendor:
+                        product_data["vendor"] = spec_vendor
+                    elif product_data.get("title"):
+                        product_data["vendor"] = product_data["title"].split()[0]
+                    else:
+                        product_data["vendor"] = None
+            except (PlaywrightTimeoutError, PlaywrightError, IndexError):
                 product_data["vendor"] = None
 
-            # 4. Pricing (Regular and Promo)
+            # 5. Pricing (Regular and Promo)
             product_data["regular_price"] = None
             product_data["promo_price"] = None
             try:
-                old_price_locator = page.locator(
-                    "//*[contains(@class, 'br-pp-op') or contains(@class, 'br-pr-old')]"
-                )
-                price_locator = page.locator(
-                    "//*[contains(@class, 'br-pp-price') or contains(@class, 'br-pr-price')]"
-                )
+                # 1. Check itemprop="price" content attribute first
+                price_meta = page.locator("[itemprop='price']").first
+                meta_val = price_meta.get_attribute("content") if price_meta.count() > 0 else None
 
-                if old_price_locator.count() > 0 and price_locator.count() > 0:
-                    old_text = old_price_locator.first.inner_text()
-                    promo_spans = price_locator.first.locator(
-                        ".//span[not(contains(@class, 'hidden'))]"
-                    )
-                    promo_text = (
-                        promo_spans.first.inner_text()
-                        if promo_spans.count() > 0
-                        else ""
-                    )
+                current_price = None
+                if meta_val and meta_val.strip().isdigit():
+                    current_price = meta_val.strip()
+                else:
+                    # Find the first visible price span to avoid club price concatenation
+                    price_spans = page.locator(
+                        "//*[contains(@class, 'br-pp-price') or contains(@class, 'br-pr-price')]//span[not(contains(@class, 'hidden'))]"
+                    ).all()
+                    for sp in price_spans:
+                        digits = extract_digits(sp.text_content())
+                        if digits and len(digits) >= 3:
+                            current_price = digits
+                            break
 
-                    old_digits = "".join(filter(str.isdigit, old_text))
-                    promo_digits = "".join(filter(str.isdigit, promo_text))
-                    product_data["regular_price"] = (
-                        old_digits if old_digits else None
-                    )
-                    product_data["promo_price"] = (
-                        promo_digits if promo_digits else None
-                    )
-                elif price_locator.count() > 0:
-                    spans = price_locator.first.locator(
-                        ".//span[not(contains(@class, 'hidden'))]"
-                    )
-                    digits = (
-                        "".join(
-                            filter(str.isdigit, spans.first.inner_text())
-                        )
-                        if spans.count() > 0
-                        else ""
-                    )
-                    product_data["regular_price"] = digits if digits else None
+                # 2. Check for old/discounted price strictly in product details block
+                old_price_loc = page.locator(".br-pr-info .br-pr-old, .br-pr-info .br-pp-op, .br-pr .br-pr-old, .br-pr .br-pp-op").first
+                has_old = old_price_loc.count() > 0 and old_price_loc.is_visible()
+
+                if has_old:
+                    old_price = extract_digits(old_price_loc.text_content())
+                    if old_price and current_price and old_price != current_price:
+                        product_data["regular_price"] = old_price
+                        product_data["promo_price"] = current_price
+                    elif current_price:
+                        product_data["regular_price"] = current_price
+                        product_data["promo_price"] = None
+                elif current_price:
+                    product_data["regular_price"] = current_price
                     product_data["promo_price"] = None
             except (PlaywrightTimeoutError, PlaywrightError):
                 product_data["regular_price"] = None
                 product_data["promo_price"] = None
 
-            # 5. Reviews Count
+            # 6. Reviews Count
             product_data["reviews_count"] = "0"
             try:
-                reviews_locator = page.locator(
-                    "//a[contains(@href, '#reviews')]"
-                )
+                reviews_locator = page.locator("//a[contains(@href, '#reviews')]")
                 if reviews_locator.count() > 0:
-                    digits = "".join(
-                        filter(str.isdigit, reviews_locator.first.inner_text())
-                    )
-                    product_data["reviews_count"] = digits if digits else "0"
+                    digits = extract_digits(reviews_locator.first.inner_text())
+                    product_data["reviews_count"] = digits if digits is not None else "0"
             except (PlaywrightTimeoutError, PlaywrightError):
                 product_data["reviews_count"] = "0"
 
-            # 6. Photos (Extract gallery URLs)
+            # 7. Photos (Extract gallery URLs)
             product_data["photos"] = []
             try:
                 photo_urls = []
-                img_elements = page.locator(
-                    "//div[contains(@class, 'br-pr-slider')]//img"
-                ).all()
+                img_elements = page.locator("//div[contains(@class, 'br-pr-slider')]//img").all()
                 for img in img_elements:
-                    src = img.get_attribute("src") or img.get_attribute(
-                        "data-src"
-                    )
+                    src = img.get_attribute("src") or img.get_attribute("data-src")
                     if src and "prod_img" in src and src not in photo_urls:
                         photo_urls.append(src)
                 product_data["photos"] = photo_urls
             except (PlaywrightTimeoutError, PlaywrightError):
                 product_data["photos"] = []
 
-            # 7. Complete Specifications Dictionary
-            specs_dict = {}
-            try:
-                spec_rows = page.locator(
-                    "//*[@id='br-characteristics']//div"
-                ).all()
-                for row in spec_rows:
-                    spans = row.locator("span").all()
-                    if len(spans) >= 2:
-                        key_title = spans[0].inner_text().strip()
-                        val_title = spans[1].inner_text().strip()
-                        if (
-                            key_title
-                            and val_title
-                            and key_title not in specs_dict
-                        ):
-                            specs_dict[key_title] = val_title
-                product_data["specifications"] = specs_dict
-            except (PlaywrightTimeoutError, PlaywrightError):
-                product_data["specifications"] = {}
-
             # 8. Specific attributes extracted from specifications dictionary
-            product_data["color"] = get_specification_value(
-                specs_dict, ["Колір", "Цвет"]
-            )
-            product_data["memory_capacity"] = get_specification_value(
-                specs_dict, ["Вбудована пам'ять", "Об'єм пам'яті"]
-            )
-            product_data["screen_diagonal"] = get_specification_value(
-                specs_dict, ["Діагональ екрану", "Діагональ"]
-            )
-            product_data["display_resolution"] = get_specification_value(
-                specs_dict, ["Роздільна здатність"]
-            )
+            product_data["color"] = get_specification_value(specs_dict, ["Колір", "Цвет"])
+            product_data["memory_capacity"] = get_specification_value(specs_dict, ["Вбудована пам'ять", "Об'єм пам'яті"])
+            product_data["screen_diagonal"] = get_specification_value(specs_dict, ["Діагональ екрану", "Діагональ"])
+            product_data["display_resolution"] = get_specification_value(specs_dict, ["Роздільна здатність"])
 
             # 9. Technical & Service Fields
             product_data["link"] = page.url
@@ -261,9 +240,7 @@ def main():
     item, created = Product.objects.get_or_create(**product_data)
 
     print("\n" + "=" * 50)
-    print(
-        f"Database sync: {'Created new record' if created else 'Already exists in DB'} (ID: {item.id})"
-    )
+    print(f"Database sync: {'Created new record' if created else 'Already exists in DB'} (ID: {item.id})")
     print("=" * 50)
 
 
