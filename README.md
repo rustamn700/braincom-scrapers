@@ -30,7 +30,7 @@ A web scraping and data persistence suite built with Python, Django ORM, and Pos
 
 ### 1. Clone Repository & Setup Virtual Environment
 ```bash
-git clone [https://github.com/rustamn700/braincom-scrapers.git](https://github.com/rustamn700/braincom-scrapers.git)
+git clone https://github.com/rustamn700/braincom-scrapers.git
 cd braincom-scrapers
 
 python -m venv venv
